@@ -8,11 +8,12 @@ import numpy as np
 from google.cloud import texttospeech
 
 # MoviePy Imports (v2 syntax)
-from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips, concatenate_videoclips, ImageClip
+from moviepy import VideoFileClip, AudioFileClip, concatenate_audioclips, concatenate_videoclips, ImageClip, CompositeAudioClip
 from moviepy.video.VideoClip import TextClip, ColorClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from moviepy.audio.AudioClip import AudioArrayClip
 from moviepy.video import fx as vfx
+from moviepy.audio import fx as afx
 
 # -----------------------------
 # CONFIG
@@ -26,6 +27,7 @@ HEADERS = {
 SUBWAY_VIDEO = "subway.mp4" 
 OUTPUT_VIDEO = "youtube_short.mp4"
 TITLE_BOX_IMAGE = "TitleBox.png"
+BACKGROUND_MUSIC = "music.mp3" 
 GOOGLE_CREDENTIALS_PATH = "google.json"
 TEMP_AUDIO_DIR = "temp_audio"
 
@@ -36,7 +38,7 @@ TITLE_FONT_PATH = "Roboto-Regular.ttf"
 # --- TESTING CONTROLS ---
 MOCK_TTS = False          
 LIMIT_SENTENCES = 3      
-AVG_WPM = 150            
+AVG_WPM = 180            
 
 # Google TTS Setup
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS_PATH
@@ -84,18 +86,12 @@ def fetch_random_post(subreddit):
 # 2. TEXT PROCESSING & TTS CLEANING
 # -----------------------------
 def clean_text_for_tts(text):
-    """Replaces Reddit shorthand with spoken-word equivalents."""
-    # AITA -> Am I the a-hole
     text = re.sub(r'\bAITA\b', "Am I the a-hole", text, flags=re.IGNORECASE)
-    # WIBTA -> Would I be the a-hole
     text = re.sub(r'\bWIBTA\b', "Would I be the a-hole", text, flags=re.IGNORECASE)
-    
-    # Ages/Genders: (24M) -> 24 male, (19F) -> 19 female
     text = re.sub(r'\((\d+)\s*[Mm]\)', r'\1 male', text)
     text = re.sub(r'\((\d+)\s*[Ff]\)', r'\1 female', text)
     text = re.sub(r'\[(\d+)\s*[Mm]\]', r'\1 male', text)
     text = re.sub(r'\[(\d+)\s*[Ff]\]', r'\1 female', text)
-    
     return text
 
 def split_text_smartly(text):
@@ -107,11 +103,9 @@ def split_text_smartly(text):
 # 3. TTS GENERATION
 # -----------------------------
 def generate_audio_for_sentence(sentence):
-    # Clean text specifically for the spoken audio
     spoken_text = clean_text_for_tts(sentence)
-    
     word_count = len(spoken_text.split())
-    estimated_duration = max(1.5, (word_count / AVG_WPM) * 60)
+    estimated_duration = max(1.0, (word_count / AVG_WPM) * 60)
     
     if MOCK_TTS:
         return None, estimated_duration
@@ -121,7 +115,7 @@ def generate_audio_for_sentence(sentence):
         voice = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Wavenet-C")
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.2 
+            speaking_rate=1.45 
         )
         response = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
         
@@ -140,10 +134,12 @@ def generate_audio_for_sentence(sentence):
 # 4. TITLE CARD GENERATOR
 # -----------------------------
 def create_title_card(title_text, duration):
-    box_clip = ImageClip(TITLE_BOX_IMAGE).with_duration(duration)
-    
-    # Coordinates (923x381)
-    # Adding a 10px internal safety margin to max_x to prevent side-clipping
+    # 1. Faster Animation: Scale 0.01 -> 1 over 0.25s
+    def resize_func(t):
+        if t < 0.25:
+            return max(0.01, t / 0.25) 
+        return 1
+        
     start_x, start_y = 35, 150
     max_x, max_y = 880, 310 
     
@@ -154,7 +150,6 @@ def create_title_card(title_text, duration):
     final_txt_clip = None
     
     while font_size > 10:
-        # We use 'caption' mode here. It's much safer for fitting text in boxes.
         temp_txt = TextClip(
             text=title_text, 
             font_size=font_size, 
@@ -178,16 +173,21 @@ def create_title_card(title_text, duration):
             font=TITLE_FONT_PATH, method='caption', size=(max_text_width, None)
         )
 
-    # Composite the text at start_x, start_y relative to the box
-    title_graphic = CompositeVideoClip(
-        [box_clip, final_txt_clip.with_position((start_x, start_y))], 
-        size=(box_clip.w, box_clip.h)
-    ).with_duration(duration)
+    static_box = ImageClip(TITLE_BOX_IMAGE).with_duration(duration)
     
+    combined_graphic = CompositeVideoClip(
+        [static_box, final_txt_clip.with_position((start_x, start_y))], 
+        size=(static_box.w, static_box.h)
+    ).with_duration(duration)
+
+    graphic_animated = combined_graphic.with_effects([vfx.Resize(resize_func)])
+
     final_comp = CompositeVideoClip(
-        [title_graphic.with_position("center")], 
+        [graphic_animated.with_position("center")], 
         size=(1080, 1920)
     ).with_duration(duration)
+    
+    final_comp = final_comp.with_effects([vfx.FadeOut(0.5)])
     
     return final_comp
 
@@ -304,6 +304,28 @@ def make_video(post_data):
         full_audio = concatenate_audioclips(all_audio_clips)
         full_text_video = concatenate_videoclips(all_video_segments)
         total_duration = full_audio.duration
+
+        # --- 3. BACKGROUND MUSIC (UPDATED) ---
+        if os.path.exists(BACKGROUND_MUSIC):
+            print("Adding background music...")
+            bg_music = AudioFileClip(BACKGROUND_MUSIC)
+            
+            # If music is long enough, pick a random start point
+            if bg_music.duration > total_duration:
+                max_start = bg_music.duration - total_duration
+                start_time = random.uniform(0, max_start)
+                bg_music = bg_music.subclipped(start_time, start_time + total_duration)
+            else:
+                # Loop if too short
+                bg_music = concatenate_audioclips([bg_music] * (int(total_duration / bg_music.duration) + 1))
+                bg_music = bg_music.subclipped(0, total_duration)
+            
+            # Volume and Fade In
+            bg_music = bg_music.with_volume_scaled(0.15).with_effects([afx.AudioFadeIn(2.0)])
+            
+            full_audio = CompositeAudioClip([full_audio, bg_music])
+        else:
+            print(f"Warning: Background music file '{BACKGROUND_MUSIC}' not found.")
 
         # --- BACKGROUND LOGIC (CROP-TO-FILL) ---
         bg = VideoFileClip(SUBWAY_VIDEO).without_audio()
